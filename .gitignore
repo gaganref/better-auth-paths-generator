@@ -1,3 +1,9 @@
+# generated files
+gen
+
+# Spec Files
+spec
+
 # dependencies (bun install)
 node_modules
 

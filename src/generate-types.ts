@@ -1,18 +1,58 @@
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { parse } from "yaml";
+import { Command } from "commander";
+import chalk from "chalk";
+import inquirer from "inquirer";
+import path from "path";
 
 // Configuration
-const OPENAPI_FILE = "better-auth.yaml";
-const OUTPUT_FILE = "better-auth.paths.ts";
+const DEFAULT_OPENAPI_FILE = "./spec/better-auth.yaml";
+const DEFAULT_OUTPUT_FILE = "./gen/better-auth.paths.ts";
 const DEFAULT_GROUP = "default";
 
 // Valid HTTP methods to process
 const HTTP_METHODS = ['get', 'post', 'put', 'delete', 'patch', 'head', 'options'];
 
+/**
+ * Resolves input file path - if no directory specified, uses ./spec/
+ */
+function resolveInputPath(inputPath: string): string {
+    // If path contains directory separator, use as is
+    if (inputPath.includes('/') || inputPath.includes('\\')) {
+        return inputPath;
+    }
+    // Otherwise, prepend ./spec/
+    return path.join('./spec', inputPath);
+}
+
+/**
+ * Generates output filename from input filename
+ */
+function generateOutputFileName(inputPath: string): string {
+    const fileName = path.basename(inputPath);
+    const nameWithoutExt = fileName.replace(/\.[^/.]+$/, '');
+    return `${nameWithoutExt}.path.ts`;
+}
+
+/**
+ * Resolves output file path - if no directory specified, uses ./gen/
+ */
+function resolveOutputPath(outputPath: string): string {
+    // If path contains directory separator, use as is
+    if (outputPath.includes('/') || outputPath.includes('\\')) {
+        return outputPath;
+    }
+    // Otherwise, prepend ./gen/
+    return path.join('./gen', outputPath);
+}
+
 // CLI Arguments interface
 interface CLIArgs {
+    inputFile: string;
+    outputFile: string;
     responseFields?: string[];
     requestFields?: string[];
+    interactive?: boolean;
 }
 
 /**
@@ -538,65 +578,185 @@ function generateImprovedCode(
 
 
 /**
- * Parses command line arguments
+ * Setup commander.js CLI
  */
-function parseArgs(): CLIArgs {
-    const args = process.argv.slice(2);
-    const result: CLIArgs = {};
+function setupCLI(): Command {
+    const program = new Command();
 
-    for (let i = 0; i < args.length; i++) {
-        const arg = args[i];
+    program
+        .name('generate-types')
+        .description(chalk.blue('Generate TypeScript path constants from OpenAPI specifications'))
+        .version('1.0.0');
 
-        if (arg === '--response-fields' || arg === '-rf') {
-            const nextArg = args[i + 1];
-            if (nextArg && !nextArg.startsWith('-')) {
-                try {
-                    result.responseFields = JSON.parse(nextArg);
-                    if (!Array.isArray(result.responseFields)) {
-                        throw new Error('Response fields must be an array');
-                    }
-                    i++;
-                } catch (error) {
-                    console.error('❌ Invalid response fields format. Expected JSON array like ["email", "name"]');
-                    process.exit(1);
-                }
-            }
-        } else if (arg === '--request-fields' || arg === '-reqf') {
-            const nextArg = args[i + 1];
-            if (nextArg && !nextArg.startsWith('-')) {
-                try {
-                    result.requestFields = JSON.parse(nextArg);
-                    if (!Array.isArray(result.requestFields)) {
-                        throw new Error('Request fields must be an array');
-                    }
-                    i++;
-                } catch (error) {
-                    console.error('❌ Invalid request fields format. Expected JSON array like ["email", "password"]');
-                    process.exit(1);
-                }
-            }
+    program
+        .option('-i, --input <file>', `Input OpenAPI file (default: ${DEFAULT_OPENAPI_FILE})`, DEFAULT_OPENAPI_FILE)
+        .option('-o, --output <file>', `Output TypeScript file (default: auto-generated from input)`, DEFAULT_OUTPUT_FILE)
+        .option('-rf, --response-fields <fields>', 'Response fields to analyze (JSON array)', parseJsonArray)
+        .option('-reqf, --request-fields <fields>', 'Request fields to analyze (JSON array)', parseJsonArray)
+        .option('--interactive', 'Run in interactive mode', false);
+
+    program.on('--help', () => {
+        console.log('');
+        console.log(chalk.yellow('Examples:'));
+        console.log('  $ generate-types                              # Interactive mode (default)');
+        console.log('  $ generate-types -i my-api.yaml              # Output: ./gen/my-api.path.ts');
+        console.log('  $ generate-types -i my-api.yaml -o custom.ts  # Output: ./gen/custom.ts');
+        console.log('  $ generate-types --response-fields \'["email", "name"]\'');
+        console.log('  $ generate-types --interactive                # Force interactive mode');
+        console.log('');
+        console.log(chalk.gray('File Path Rules:'));
+        console.log(chalk.gray('  • Input files without path → ./spec/{filename}'));
+        console.log(chalk.gray('  • Output files without path → ./gen/{filename}'));
+        console.log(chalk.gray('  • Output filename auto-generated from input if not specified'));
+        console.log(chalk.gray('  • Auto-generated format: {input-name}.path.ts'));
+        console.log(chalk.gray('  • Paths with / or \\ are used as-is'));
+        console.log('');
+        console.log(chalk.gray('Note: Interactive mode is used by default when no arguments are provided.'));
+        console.log('');
+    });
+
+    return program;
+}
+
+/**
+ * Parse JSON array from command line
+ */
+function parseJsonArray(value: string): string[] {
+    try {
+        const parsed = JSON.parse(value);
+        if (!Array.isArray(parsed)) {
+            throw new Error('Must be an array');
         }
+        return parsed;
+    } catch (error) {
+        console.error(chalk.red('❌ Invalid JSON array format. Expected format: ["field1", "field2"]'));
+        process.exit(1);
+    }
+}
+
+/**
+ * Run interactive mode
+ */
+async function runInteractive(): Promise<CLIArgs> {
+    console.log(chalk.blue.bold('\n🎛️  Interactive Mode\n'));
+    console.log(chalk.gray('Configure your OpenAPI type generation settings:\n'));
+
+    const answers = await inquirer.prompt([
+        {
+            type: 'input',
+            name: 'inputFile',
+            message: 'OpenAPI input file:',
+            default: 'better-auth.yaml',
+            validate: (input) => input.trim() !== '' || 'Input file cannot be empty'
+        },
+        {
+            type: 'confirm',
+            name: 'useAutoOutput',
+            message: 'Auto-generate output filename from input?',
+            default: true
+        },
+        {
+            type: 'input',
+            name: 'outputFile',
+            message: 'TypeScript output file:',
+            when: (answers: any) => !answers.useAutoOutput,
+            default: (answers: any) => generateOutputFileName(answers.inputFile),
+            validate: (input) => input.trim() !== '' || 'Output file cannot be empty'
+        },
+        {
+            type: 'confirm',
+            name: 'includeResponseFields',
+            message: 'Do you want to analyze response fields?',
+            default: false
+        },
+        {
+            type: 'input',
+            name: 'responseFields',
+            message: 'Enter response fields (comma-separated):',
+            when: (answers) => answers.includeResponseFields,
+            filter: (input) => input.split(',').map((field: string) => field.trim()).filter((field: string) => field !== ''),
+            validate: (input) => input.length > 0 || 'Please enter at least one field'
+        },
+        {
+            type: 'confirm',
+            name: 'includeRequestFields',
+            message: 'Do you want to analyze request fields?',
+            default: false
+        },
+        {
+            type: 'input',
+            name: 'requestFields',
+            message: 'Enter request fields (comma-separated):',
+            when: (answers) => answers.includeRequestFields,
+            filter: (input) => input.split(',').map((field: string) => field.trim()).filter((field: string) => field !== ''),
+            validate: (input) => input.length > 0 || 'Please enter at least one field'
+        }
+    ]);
+
+    const outputFile = answers.useAutoOutput
+        ? generateOutputFileName(answers.inputFile)
+        : answers.outputFile;
+
+    return {
+        inputFile: resolveInputPath(answers.inputFile),
+        outputFile: resolveOutputPath(outputFile),
+        responseFields: answers.responseFields,
+        requestFields: answers.requestFields,
+        interactive: true
+    };
+}
+
+/**
+ * Parse command line arguments
+ */
+async function parseArgs(): Promise<CLIArgs> {
+    const program = setupCLI();
+    program.parse();
+
+    const options = program.opts();
+    const hasRelevantArgs = options.input !== DEFAULT_OPENAPI_FILE ||
+        options.output !== DEFAULT_OUTPUT_FILE ||
+        options.responseFields ||
+        options.requestFields;
+
+    // Default to interactive mode if no relevant arguments are provided
+    if (options.interactive || !hasRelevantArgs) {
+        return await runInteractive();
     }
 
-    return result;
+    const outputFile = options.output === DEFAULT_OUTPUT_FILE
+        ? generateOutputFileName(options.input)
+        : options.output;
+
+    return {
+        inputFile: resolveInputPath(options.input),
+        outputFile: resolveOutputPath(outputFile),
+        responseFields: options.responseFields,
+        requestFields: options.requestFields,
+        interactive: false
+    };
 }
 
 /**
  * Main function
  */
-function main(): void {
+async function main(): Promise<void> {
     try {
-        const args = parseArgs();
+        const args = await parseArgs();
 
-        console.log(`🔄 Reading OpenAPI specification from: ${OPENAPI_FILE}`);
-        const openApiContent = readFileSync(OPENAPI_FILE, "utf8");
+        // Use parsed args
+        const inputFile = args.inputFile;
+        const outputFile = args.outputFile;
+
+        console.log(chalk.blue(`🔄 Reading OpenAPI specification from: ${chalk.cyan(inputFile)}`));
+        const openApiContent = readFileSync(inputFile, "utf8");
         const openApi = parse(openApiContent);
 
         if (!openApi || !openApi.paths) {
             throw new Error("Invalid OpenAPI specification");
         }
 
-        console.log(`✅ Successfully parsed OpenAPI specification`);
+        console.log(chalk.green(`✅ Successfully parsed OpenAPI specification`));
 
         // Extract basic group paths
         const groupPaths = extractGroupPaths(openApi);
@@ -604,43 +764,49 @@ function main(): void {
         // Extract response field paths if specified
         let responseFieldPaths = { fieldPaths: {}, groupFieldPaths: {} };
         if (args.responseFields && args.responseFields.length > 0) {
-            console.log(`🔍 Analyzing response fields: ${args.responseFields.join(', ')}`);
+            console.log(chalk.yellow(`🔍 Analyzing response fields: ${chalk.cyan(args.responseFields.join(', '))}`));
             responseFieldPaths = extractResponseFieldPaths(openApi, args.responseFields);
         }
 
         // Extract request field paths if specified
         let requestFieldPaths = { fieldPaths: {}, groupFieldPaths: {} };
         if (args.requestFields && args.requestFields.length > 0) {
-            console.log(`🔍 Analyzing request fields: ${args.requestFields.join(', ')}`);
+            console.log(chalk.yellow(`🔍 Analyzing request fields: ${chalk.cyan(args.requestFields.join(', '))}`));
             requestFieldPaths = extractRequestFieldPaths(openApi, args.requestFields);
         }
 
-        console.log(`⚒️ Generating improved TypeScript code...`);
+        console.log(chalk.blue(`⚒️ Generating improved TypeScript code...`));
         const generatedCode = generateImprovedCode(groupPaths, responseFieldPaths, requestFieldPaths);
 
-        writeFileSync(OUTPUT_FILE, generatedCode);
-        console.log(`✅ Successfully generated improved constants in: ${OUTPUT_FILE}`);
-        console.log(`📦 Generated constants for ${Object.keys(groupPaths).length} categories`);
+        // Ensure output directory exists
+        const outputDir = path.dirname(outputFile);
+        mkdirSync(outputDir, { recursive: true });
+
+        writeFileSync(outputFile, generatedCode);
+        console.log(chalk.green(`✅ Successfully generated improved constants in: ${chalk.cyan(outputFile)}`));
+        console.log(chalk.magenta(`📦 Generated constants for ${chalk.bold(Object.keys(groupPaths).length)} categories`));
 
         // Log results
-        console.log(`📊 Processing Statistics:`);
+        console.log(chalk.blue(`📊 Processing Statistics:`));
         for (const group in groupPaths) {
-            console.log(`  "${group}": ${groupPaths[group].length} paths`);
+            console.log(`  ${chalk.cyan(`"${group}"`)} ${chalk.gray('→')} ${chalk.yellow(groupPaths[group].length)} paths`);
         }
 
         if (args.responseFields) {
-            console.log(`🎯 Generated response field constants for: ${args.responseFields.join(', ')}`);
+            console.log(chalk.green(`🎯 Generated response field constants for: ${chalk.cyan(args.responseFields.join(', '))}`));
         }
 
         if (args.requestFields) {
-            console.log(`📝 Generated request field constants for: ${args.requestFields.join(', ')}`);
+            console.log(chalk.green(`📝 Generated request field constants for: ${chalk.cyan(args.requestFields.join(', '))}`));
         }
 
     } catch (error) {
-        console.error(`❌ Error generating paths:`, error);
+        console.error(chalk.red(`❌ Error generating paths:`), error);
         process.exit(1);
     }
 }
 
 // Run the main function
-main();
+(async () => {
+    await main();
+})();
