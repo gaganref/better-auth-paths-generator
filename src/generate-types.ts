@@ -1,13 +1,15 @@
-import { readFileSync, writeFileSync, mkdirSync } from "fs";
-import { parse } from "yaml";
+import { writeFileSync, mkdirSync } from "fs";
+import { validate, dereference, bundle } from "@scalar/openapi-parser";
+import { readFiles } from "@scalar/openapi-parser/plugins";
 import { Command } from "commander";
 import chalk from "chalk";
 import inquirer from "inquirer";
 import path from "path";
+import type { OpenAPI } from "@scalar/openapi-types";
 
 // Configuration
-const DEFAULT_OPENAPI_FILE = "./spec/better-auth.yaml";
-const DEFAULT_OUTPUT_FILE = "./gen/better-auth.paths.ts";
+const DEFAULT_OPENAPI_FILE = "better-auth";
+const DEFAULT_OUTPUT_FILE = ""; // Will be auto-generated from input
 const DEFAULT_GROUP = "default";
 
 // Valid HTTP methods to process
@@ -15,14 +17,18 @@ const HTTP_METHODS = ['get', 'post', 'put', 'delete', 'patch', 'head', 'options'
 
 /**
  * Resolves input file path - if no directory specified, uses ./spec/
+ * Automatically adds .yaml extension if not present
  */
 function resolveInputPath(inputPath: string): string {
+    // Add .yaml extension if not present
+    let processedPath = inputPath.endsWith('.yaml') ? inputPath : `${inputPath}.yaml`;
+
     // If path contains directory separator, use as is
-    if (inputPath.includes('/') || inputPath.includes('\\')) {
-        return inputPath;
+    if (processedPath.includes('/') || processedPath.includes('\\')) {
+        return processedPath;
     }
     // Otherwise, prepend ./spec/
-    return path.join('./spec', inputPath);
+    return path.join('./spec', processedPath);
 }
 
 /**
@@ -156,14 +162,19 @@ function pathToPropertyName(path: string, commonPrefix: string = ""): string {
 /**
  * Extracts and groups paths by their groups from OpenAPI specification
  */
-function extractGroupPaths(openApi: any): Record<string, string[]> {
+function extractGroupPaths(openApi: OpenAPI.Document): Record<string, string[]> {
     const groupPaths: Record<string, Set<string>> = {};
+
+    if (!openApi.paths) {
+        return {};
+    }
 
     for (const path in openApi.paths) {
         const pathItem = openApi.paths[path];
+        if (!pathItem) continue;
 
         for (const method of HTTP_METHODS) {
-            const operation = pathItem[method];
+            const operation = (pathItem as any)[method]; // Type assertion for method access
             if (operation) {
                 if (operation.tags && Array.isArray(operation.tags) && operation.tags.length > 0) {
                     for (const group of operation.tags) {
@@ -191,39 +202,150 @@ function extractGroupPaths(openApi: any): Record<string, string[]> {
 }
 
 /**
- * Recursively searches for fields in a schema object
+ * Debug logging for field detection in nested structures
  */
-function findFieldsInSchema(schema: any, targetFields: string[]): string[] {
+function logFieldDetection(path: string, method: string, field: string, location: 'request' | 'response', nested: boolean = false) {
+    const locationText = location === 'request' ? 'request body' : 'response';
+    const nestedText = nested ? ' (nested)' : '';
+    console.log(chalk.gray(`    📍 Found "${field}" in ${method.toUpperCase()} ${path} ${locationText}${nestedText}`));
+}
+
+/**
+ * Recursively searches for fields in a schema object
+ * Handles nested objects, optional fields, and empty objects that could contain target fields
+ */
+function findFieldsInSchema(
+    schema: OpenAPI.SchemaObject | any,
+    targetFields: string[],
+    depth: number = 0,
+    debug: boolean = false,
+    context: { path?: string; method?: string; location?: 'request' | 'response' } = {}
+): string[] {
     const foundFields: string[] = [];
 
     if (!schema || typeof schema !== 'object') {
         return foundFields;
     }
 
+    // Prevent infinite recursion
+    if (depth > 10) {
+        return foundFields;
+    }
+
+    // Check direct properties
     if (schema.properties && typeof schema.properties === 'object') {
         for (const field of targetFields) {
             if (field in schema.properties) {
                 foundFields.push(field);
+                if (debug && context.path && context.method && context.location) {
+                    logFieldDetection(context.path, context.method, field, context.location, depth > 0);
+                }
             }
         }
 
+        // Recursively check nested properties
         for (const prop in schema.properties) {
-            const nestedFields = findFieldsInSchema(schema.properties[prop], targetFields);
+            const nestedFields = findFieldsInSchema(
+                schema.properties[prop],
+                targetFields,
+                depth + 1,
+                debug,
+                context
+            );
             foundFields.push(...nestedFields);
         }
     }
 
+    // Handle array items
     if (schema.items) {
-        const nestedFields = findFieldsInSchema(schema.items, targetFields);
+        const nestedFields = findFieldsInSchema(
+            schema.items,
+            targetFields,
+            depth + 1,
+            debug,
+            context
+        );
         foundFields.push(...nestedFields);
     }
 
+    // Handle object schemas without explicit properties (could be dynamic objects)
+    if (schema.type === 'object' && !schema.properties) {
+        foundFields.push(...targetFields);
+        if (debug && context.path && context.method && context.location) {
+            for (const field of targetFields) {
+                console.log(chalk.gray(`    🔍 Potential field "${field}" in ${context.method.toUpperCase()} ${context.path} ${context.location} (dynamic object)`));
+            }
+        }
+    }
+
+    // Handle additionalProperties (objects that can have additional dynamic properties)
+    if (schema.additionalProperties) {
+        if (typeof schema.additionalProperties === 'object') {
+            const nestedFields = findFieldsInSchema(
+                schema.additionalProperties,
+                targetFields,
+                depth + 1,
+                debug,
+                context
+            );
+            foundFields.push(...nestedFields);
+        } else if (schema.additionalProperties === true) {
+            foundFields.push(...targetFields);
+            if (debug && context.path && context.method && context.location) {
+                for (const field of targetFields) {
+                    console.log(chalk.gray(`    ➕ Potential field "${field}" in ${context.method.toUpperCase()} ${context.path} ${context.location} (additional properties)`));
+                }
+            }
+        }
+    }
+
+    // Handle combined schemas
     const combinedSchemas = ['allOf', 'oneOf', 'anyOf'];
     for (const key of combinedSchemas) {
         if (schema[key] && Array.isArray(schema[key])) {
             for (const subSchema of schema[key]) {
-                const nestedFields = findFieldsInSchema(subSchema, targetFields);
+                const nestedFields = findFieldsInSchema(
+                    subSchema,
+                    targetFields,
+                    depth + 1,
+                    debug,
+                    context
+                );
                 foundFields.push(...nestedFields);
+            }
+        }
+    }
+
+    // Handle patternProperties (objects with pattern-based property names)
+    if (schema.patternProperties && typeof schema.patternProperties === 'object') {
+        for (const pattern in schema.patternProperties) {
+            const nestedFields = findFieldsInSchema(
+                schema.patternProperties[pattern],
+                targetFields,
+                depth + 1,
+                debug,
+                context
+            );
+            foundFields.push(...nestedFields);
+        }
+    }
+
+    // Handle discriminator schemas (for polymorphic objects)
+    if (schema.discriminator && schema.discriminator.mapping) {
+        foundFields.push(...targetFields);
+        if (debug && context.path && context.method && context.location) {
+            for (const field of targetFields) {
+                console.log(chalk.gray(`    🔀 Potential field "${field}" in ${context.method.toUpperCase()} ${context.path} ${context.location} (discriminator)`));
+            }
+        }
+    }
+
+    // Handle free-form objects (objects with no schema restrictions)
+    if (schema.type === 'object' && !schema.properties && !schema.additionalProperties && !schema.patternProperties) {
+        foundFields.push(...targetFields);
+        if (debug && context.path && context.method && context.location) {
+            for (const field of targetFields) {
+                console.log(chalk.gray(`    🆓 Potential field "${field}" in ${context.method.toUpperCase()} ${context.path} ${context.location} (free-form object)`));
             }
         }
     }
@@ -235,7 +357,7 @@ function findFieldsInSchema(schema: any, targetFields: string[]): string[] {
  * Extracts paths that return specific fields in their responses
  */
 function extractResponseFieldPaths(
-    openApi: any,
+    openApi: OpenAPI.Document,
     targetFields: string[]
 ): {
     fieldPaths: Record<string, string[]>;
@@ -249,21 +371,29 @@ function extractResponseFieldPaths(
         groupFieldPaths[field] = {};
     }
 
+    if (!openApi.paths) {
+        return {
+            fieldPaths: Object.fromEntries(targetFields.map(field => [field, []])),
+            groupFieldPaths: Object.fromEntries(targetFields.map(field => [field, {}]))
+        };
+    }
+
     for (const path in openApi.paths) {
         const pathItem = openApi.paths[path];
+        if (!pathItem) continue;
 
         for (const method of HTTP_METHODS) {
-            const operation = pathItem[method];
+            const operation = (pathItem as any)[method]; // Type assertion for method access
             if (operation && operation.responses) {
                 const groups = operation.tags || [DEFAULT_GROUP];
 
                 for (const responseCode in operation.responses) {
                     const response = operation.responses[responseCode];
-                    if (response.content) {
-                        for (const mediaType in response.content) {
-                            const mediaObj = response.content[mediaType];
+                    if (response && (response as any).content) {
+                        for (const mediaType in (response as any).content) {
+                            const mediaObj = (response as any).content[mediaType];
                             if (mediaObj.schema) {
-                                const foundFields = findFieldsInSchema(mediaObj.schema, targetFields);
+                                const foundFields = findFieldsInSchema(mediaObj.schema, targetFields, 0, true, { path, method, location: 'response' });
 
                                 for (const foundField of foundFields) {
                                     fieldPaths[foundField].add(path);
@@ -304,7 +434,7 @@ function extractResponseFieldPaths(
  * Extracts paths that have specific fields in their request bodies
  */
 function extractRequestFieldPaths(
-    openApi: any,
+    openApi: OpenAPI.Document,
     targetFields: string[]
 ): {
     fieldPaths: Record<string, string[]>;
@@ -318,19 +448,27 @@ function extractRequestFieldPaths(
         groupFieldPaths[field] = {};
     }
 
+    if (!openApi.paths) {
+        return {
+            fieldPaths: Object.fromEntries(targetFields.map(field => [field, []])),
+            groupFieldPaths: Object.fromEntries(targetFields.map(field => [field, {}]))
+        };
+    }
+
     for (const path in openApi.paths) {
         const pathItem = openApi.paths[path];
+        if (!pathItem) continue;
 
         for (const method of HTTP_METHODS) {
-            const operation = pathItem[method];
+            const operation = (pathItem as any)[method]; // Type assertion for method access
             if (operation && operation.requestBody) {
                 const groups = operation.tags || [DEFAULT_GROUP];
 
-                if (operation.requestBody.content) {
-                    for (const mediaType in operation.requestBody.content) {
-                        const mediaObj = operation.requestBody.content[mediaType];
+                if ((operation.requestBody as any).content) {
+                    for (const mediaType in (operation.requestBody as any).content) {
+                        const mediaObj = (operation.requestBody as any).content[mediaType];
                         if (mediaObj.schema) {
-                            const foundFields = findFieldsInSchema(mediaObj.schema, targetFields);
+                            const foundFields = findFieldsInSchema(mediaObj.schema, targetFields, 0, true, { path, method, location: 'request' });
 
                             for (const foundField of foundFields) {
                                 fieldPaths[foundField].add(path);
@@ -437,13 +575,23 @@ function generateImprovedCode(
         output += `// RESPONSE FIELD PATHS\n`;
         output += `// ============================================\n\n`;
 
-        output += `// Paths that return specific fields in response (organized by field and group)\n`;
-        output += `export const PathsReturningField = {\n`;
+        output += `// Paths that have specific fields in response (organized by field and group)\n`;
+        output += `export const PathsWithResponseField = {\n`;
 
         for (const field in responseFieldPaths.groupFieldPaths) {
+            // Skip fields with no paths
+            if (responseFieldPaths.fieldPaths[field].length === 0) {
+                continue;
+            }
+
             output += `  ${field}: {\n`;
 
             for (const group in responseFieldPaths.groupFieldPaths[field]) {
+                // Skip empty groups
+                if (responseFieldPaths.groupFieldPaths[field][group].length === 0) {
+                    continue;
+                }
+
                 const validId = toValidIdentifier(group);
                 output += `    ${validId}: [\n`;
                 for (const path of responseFieldPaths.groupFieldPaths[field][group]) {
@@ -458,15 +606,25 @@ function generateImprovedCode(
 
         output += `} as const;\n\n`;
 
-        // All paths returning field
-        output += `// All paths that return specific fields in response (organized by field)\n`;
-        output += `export const AllPathsReturningField = {\n`;
+        // All paths with response field
+        output += `// All paths that have specific fields in response (organized by field)\n`;
+        output += `export const AllPathsWithResponseField = {\n`;
 
         for (const field in responseFieldPaths.fieldPaths) {
+            // Skip fields with no paths
+            if (responseFieldPaths.fieldPaths[field].length === 0) {
+                continue;
+            }
+
             output += `  ${field}: [\n`;
             for (const group in responseFieldPaths.groupFieldPaths[field]) {
+                // Skip empty groups
+                if (responseFieldPaths.groupFieldPaths[field][group].length === 0) {
+                    continue;
+                }
+
                 const validId = toValidIdentifier(group);
-                output += `    ...PathsReturningField.${field}.${validId},\n`;
+                output += `    ...PathsWithResponseField.${field}.${validId},\n`;
             }
             output += `  ],\n`;
         }
@@ -480,13 +638,23 @@ function generateImprovedCode(
         output += `// REQUEST FIELD PATHS\n`;
         output += `// ============================================\n\n`;
 
-        output += `// Paths that expect specific fields in request body (organized by field and group)\n`;
-        output += `export const PathsExpectingField = {\n`;
+        output += `// Paths that have specific fields in request body (organized by field and group)\n`;
+        output += `export const PathsWithRequestField = {\n`;
 
         for (const field in requestFieldPaths.groupFieldPaths) {
+            // Skip fields with no paths
+            if (requestFieldPaths.fieldPaths[field].length === 0) {
+                continue;
+            }
+
             output += `  ${field}: {\n`;
 
             for (const group in requestFieldPaths.groupFieldPaths[field]) {
+                // Skip empty groups
+                if (requestFieldPaths.groupFieldPaths[field][group].length === 0) {
+                    continue;
+                }
+
                 const validId = toValidIdentifier(group);
                 output += `    ${validId}: [\n`;
                 for (const path of requestFieldPaths.groupFieldPaths[field][group]) {
@@ -501,15 +669,25 @@ function generateImprovedCode(
 
         output += `} as const;\n\n`;
 
-        // All paths expecting field
-        output += `// All paths that expect specific fields in request body (organized by field)\n`;
-        output += `export const AllPathsExpectingField = {\n`;
+        // All paths with request field
+        output += `// All paths that have specific fields in request body (organized by field)\n`;
+        output += `export const AllPathsWithRequestField = {\n`;
 
         for (const field in requestFieldPaths.fieldPaths) {
+            // Skip fields with no paths
+            if (requestFieldPaths.fieldPaths[field].length === 0) {
+                continue;
+            }
+
             output += `  ${field}: [\n`;
             for (const group in requestFieldPaths.groupFieldPaths[field]) {
+                // Skip empty groups
+                if (requestFieldPaths.groupFieldPaths[field][group].length === 0) {
+                    continue;
+                }
+
                 const validId = toValidIdentifier(group);
-                output += `    ...PathsExpectingField.${field}.${validId},\n`;
+                output += `    ...PathsWithRequestField.${field}.${validId},\n`;
             }
             output += `  ],\n`;
         }
@@ -538,38 +716,38 @@ function generateImprovedCode(
 
     // ResponseFields and related types
     if (Object.keys(responseFieldPaths.fieldPaths).length > 0) {
-        output += `// Response field types derived from PathsReturningField\n`;
-        output += `type PathsReturningFieldAsType = typeof PathsReturningField;\n`;
-        output += `export type ResponseFields = keyof PathsReturningFieldAsType;\n`;
+        output += `// Response field types derived from PathsWithResponseField\n`;
+        output += `type PathsWithResponseFieldAsType = typeof PathsWithResponseField;\n`;
+        output += `export type ResponseFields = keyof PathsWithResponseFieldAsType;\n`;
         output += `export type ResponseFieldGroups<Field extends ResponseFields> =\n`;
-        output += `  keyof PathsReturningFieldAsType[Field];\n`;
+        output += `  keyof PathsWithResponseFieldAsType[Field];\n`;
         output += `export type ResponseFieldGroupPaths<\n`;
         output += `  Field extends ResponseFields,\n`;
-        output += `  Group extends keyof PathsReturningFieldAsType[Field],\n`;
-        output += `> = PathsReturningFieldAsType[Field][Group];\n\n`;
+        output += `  Group extends keyof PathsWithResponseFieldAsType[Field],\n`;
+        output += `> = PathsWithResponseFieldAsType[Field][Group];\n\n`;
 
-        // AllPathsReturningField type
-        output += `// All paths returning field type\n`;
-        output += `type AllPathsReturningFieldAsType = typeof AllPathsReturningField;\n`;
-        output += `export type AllPathsReturningField<Field extends ResponseFields> = AllPathsReturningFieldAsType[Field][number];\n\n`;
+        // AllPathsWithResponseField type
+        output += `// All paths with response field type\n`;
+        output += `type AllPathsWithResponseFieldAsType = typeof AllPathsWithResponseField;\n`;
+        output += `export type AllPathsWithResponseField<Field extends ResponseFields> = AllPathsWithResponseFieldAsType[Field][number];\n\n`;
     }
 
     // RequestFields and related types  
     if (Object.keys(requestFieldPaths.fieldPaths).length > 0) {
-        output += `// Request field types derived from PathsExpectingField\n`;
-        output += `type PathsExpectingFieldAsType = typeof PathsExpectingField;\n`;
-        output += `export type RequestFields = keyof PathsExpectingFieldAsType;\n`;
+        output += `// Request field types derived from PathsWithRequestField\n`;
+        output += `type PathsWithRequestFieldAsType = typeof PathsWithRequestField;\n`;
+        output += `export type RequestFields = keyof PathsWithRequestFieldAsType;\n`;
         output += `export type RequestFieldGroups<Field extends RequestFields> =\n`;
-        output += `  keyof PathsExpectingFieldAsType[Field];\n`;
+        output += `  keyof PathsWithRequestFieldAsType[Field];\n`;
         output += `export type RequestFieldGroupPaths<\n`;
         output += `  Field extends RequestFields,\n`;
-        output += `  Group extends keyof PathsExpectingFieldAsType[Field],\n`;
-        output += `> = PathsExpectingFieldAsType[Field][Group];\n\n`;
+        output += `  Group extends keyof PathsWithRequestFieldAsType[Field],\n`;
+        output += `> = PathsWithRequestFieldAsType[Field][Group];\n\n`;
 
-        // AllPathsExpectingField type
-        output += `// All paths expecting field type\n`;
-        output += `type AllPathsExpectingFieldAsType = typeof AllPathsExpectingField;\n`;
-        output += `export type AllPathsExpectingField<Field extends RequestFields> = AllPathsExpectingFieldAsType[Field][number];\n\n`;
+        // AllPathsWithRequestField type
+        output += `// All paths with request field type\n`;
+        output += `type AllPathsWithRequestFieldAsType = typeof AllPathsWithRequestField;\n`;
+        output += `export type AllPathsWithRequestField<Field extends RequestFields> = AllPathsWithRequestFieldAsType[Field][number];\n\n`;
     }
 
 
@@ -589,8 +767,8 @@ function setupCLI(): Command {
         .version('1.0.0');
 
     program
-        .option('-i, --input <file>', `Input OpenAPI file (default: ${DEFAULT_OPENAPI_FILE})`, DEFAULT_OPENAPI_FILE)
-        .option('-o, --output <file>', `Output TypeScript file (default: auto-generated from input)`, DEFAULT_OUTPUT_FILE)
+        .option('-i, --input <file>', `Input OpenAPI file name (no .yaml extension needed, default: ${DEFAULT_OPENAPI_FILE})`, DEFAULT_OPENAPI_FILE)
+        .option('-o, --output <file>', `Output TypeScript file (default: auto-generated from input)`)
         .option('-rf, --response-fields <fields>', 'Response fields to analyze (JSON array)', parseJsonArray)
         .option('-reqf, --request-fields <fields>', 'Request fields to analyze (JSON array)', parseJsonArray)
         .option('--interactive', 'Run in interactive mode', false);
@@ -599,17 +777,24 @@ function setupCLI(): Command {
         console.log('');
         console.log(chalk.yellow('Examples:'));
         console.log('  $ generate-types                              # Interactive mode (default)');
-        console.log('  $ generate-types -i my-api.yaml              # Output: ./gen/my-api.path.ts');
-        console.log('  $ generate-types -i my-api.yaml -o custom.ts  # Output: ./gen/custom.ts');
-        console.log('  $ generate-types --response-fields \'["email", "name"]\'');
+        console.log('  $ generate-types -i my-api                   # Output: ./gen/my-api.path.ts');
+        console.log('  $ generate-types -i my-api -o custom.ts      # Output: ./gen/custom.ts');
+        console.log('  $ generate-types -i my-api --response-fields \'["email", "name"]\'');
+        console.log('  $ generate-types -i my-api --request-fields \'["password", "token"]\'');
         console.log('  $ generate-types --interactive                # Force interactive mode');
         console.log('');
         console.log(chalk.gray('File Path Rules:'));
-        console.log(chalk.gray('  • Input files without path → ./spec/{filename}'));
+        console.log(chalk.gray('  • Input files: just filename (no .yaml extension needed)'));
+        console.log(chalk.gray('  • Input files without path → ./spec/{filename}.yaml'));
         console.log(chalk.gray('  • Output files without path → ./gen/{filename}'));
         console.log(chalk.gray('  • Output filename auto-generated from input if not specified'));
         console.log(chalk.gray('  • Auto-generated format: {input-name}.path.ts'));
         console.log(chalk.gray('  • Paths with / or \\ are used as-is'));
+        console.log('');
+        console.log(chalk.gray('Interactive Mode:'));
+        console.log(chalk.gray('  • No confirmation prompts - just direct input'));
+        console.log(chalk.gray('  • Leave fields empty to skip analysis'));
+        console.log(chalk.gray('  • Displays equivalent command for reuse'));
         console.log('');
         console.log(chalk.gray('Note: Interactive mode is used by default when no arguments are provided.'));
         console.log('');
@@ -645,65 +830,67 @@ async function runInteractive(): Promise<CLIArgs> {
         {
             type: 'input',
             name: 'inputFile',
-            message: 'OpenAPI input file:',
-            default: 'better-auth.yaml',
+            message: 'OpenAPI YAML file name (without .yaml extension):',
+            default: 'better-auth',
             validate: (input) => input.trim() !== '' || 'Input file cannot be empty'
-        },
-        {
-            type: 'confirm',
-            name: 'useAutoOutput',
-            message: 'Auto-generate output filename from input?',
-            default: true
         },
         {
             type: 'input',
             name: 'outputFile',
-            message: 'TypeScript output file:',
-            when: (answers: any) => !answers.useAutoOutput,
-            default: (answers: any) => generateOutputFileName(answers.inputFile),
-            validate: (input) => input.trim() !== '' || 'Output file cannot be empty'
-        },
-        {
-            type: 'confirm',
-            name: 'includeResponseFields',
-            message: 'Do you want to analyze response fields?',
-            default: false
+            message: 'TypeScript output file name (leave empty for auto-generated):',
+            default: ''
         },
         {
             type: 'input',
             name: 'responseFields',
-            message: 'Enter response fields (comma-separated):',
-            when: (answers) => answers.includeResponseFields,
-            filter: (input) => input.split(',').map((field: string) => field.trim()).filter((field: string) => field !== ''),
-            validate: (input) => input.length > 0 || 'Please enter at least one field'
-        },
-        {
-            type: 'confirm',
-            name: 'includeRequestFields',
-            message: 'Do you want to analyze request fields?',
-            default: false
+            message: 'Response fields to analyze (comma-separated, leave empty to skip):',
+            default: '',
+            filter: (input) => input.trim() === '' ? [] : input.split(',').map((field: string) => field.trim()).filter((field: string) => field !== '')
         },
         {
             type: 'input',
             name: 'requestFields',
-            message: 'Enter request fields (comma-separated):',
-            when: (answers) => answers.includeRequestFields,
-            filter: (input) => input.split(',').map((field: string) => field.trim()).filter((field: string) => field !== ''),
-            validate: (input) => input.length > 0 || 'Please enter at least one field'
+            message: 'Request fields to analyze (comma-separated, leave empty to skip):',
+            default: '',
+            filter: (input) => input.trim() === '' ? [] : input.split(',').map((field: string) => field.trim()).filter((field: string) => field !== '')
         }
     ]);
 
-    const outputFile = answers.useAutoOutput
-        ? generateOutputFileName(answers.inputFile)
+    // Add .yaml extension if not present
+    const inputFileName = answers.inputFile.endsWith('.yaml') ? answers.inputFile : `${answers.inputFile}.yaml`;
+
+    const outputFile = answers.outputFile.trim() === ''
+        ? generateOutputFileName(inputFileName)
         : answers.outputFile;
 
-    return {
-        inputFile: resolveInputPath(answers.inputFile),
+    const result = {
+        inputFile: resolveInputPath(inputFileName),
         outputFile: resolveOutputPath(outputFile),
-        responseFields: answers.responseFields,
-        requestFields: answers.requestFields,
+        responseFields: answers.responseFields.length > 0 ? answers.responseFields : undefined,
+        requestFields: answers.requestFields.length > 0 ? answers.requestFields : undefined,
         interactive: true
     };
+
+    // Print the equivalent command for reuse
+    console.log(chalk.blue('\n📋 Equivalent command for reuse:'));
+    let command = `generate-types -i ${answers.inputFile}`;
+
+    if (answers.outputFile.trim() !== '') {
+        command += ` -o ${answers.outputFile}`;
+    }
+
+    if (answers.responseFields.length > 0) {
+        command += ` --response-fields '${JSON.stringify(answers.responseFields)}'`;
+    }
+
+    if (answers.requestFields.length > 0) {
+        command += ` --request-fields '${JSON.stringify(answers.requestFields)}'`;
+    }
+
+    console.log(chalk.cyan(command));
+    console.log('');
+
+    return result;
 }
 
 /**
@@ -715,7 +902,7 @@ async function parseArgs(): Promise<CLIArgs> {
 
     const options = program.opts();
     const hasRelevantArgs = options.input !== DEFAULT_OPENAPI_FILE ||
-        options.output !== DEFAULT_OUTPUT_FILE ||
+        options.output ||
         options.responseFields ||
         options.requestFields;
 
@@ -724,12 +911,13 @@ async function parseArgs(): Promise<CLIArgs> {
         return await runInteractive();
     }
 
-    const outputFile = options.output === DEFAULT_OUTPUT_FILE
-        ? generateOutputFileName(options.input)
-        : options.output;
+    // Add .yaml extension if not present for command line input
+    const inputFileName = options.input.endsWith('.yaml') ? options.input : `${options.input}.yaml`;
+
+    const outputFile = options.output || generateOutputFileName(inputFileName);
 
     return {
-        inputFile: resolveInputPath(options.input),
+        inputFile: resolveInputPath(inputFileName),
         outputFile: resolveOutputPath(outputFile),
         responseFields: options.responseFields,
         requestFields: options.requestFields,
@@ -749,14 +937,75 @@ async function main(): Promise<void> {
         const outputFile = args.outputFile;
 
         console.log(chalk.blue(`🔄 Reading OpenAPI specification from: ${chalk.cyan(inputFile)}`));
-        const openApiContent = readFileSync(inputFile, "utf8");
-        const openApi = parse(openApiContent);
 
-        if (!openApi || !openApi.paths) {
-            throw new Error("Invalid OpenAPI specification");
+        // Use Scalar's OpenAPI parser to bundle and load the spec
+        const bundleResult = await bundle(inputFile, {
+            plugins: [readFiles()],
+            treeShake: false // Keep all parts of the specification
+        });
+
+        if (!bundleResult) {
+            throw new Error("Failed to bundle OpenAPI specification");
         }
 
-        console.log(chalk.green(`✅ Successfully parsed OpenAPI specification`));
+        console.log(chalk.green(`✅ Successfully loaded OpenAPI specification`));
+
+        // Validate the bundled specification (but allow fallback if validation fails)
+        let openApi: OpenAPI.Document;
+
+        try {
+            const validateResult = await validate(bundleResult);
+
+            if (validateResult.valid && validateResult.specification) {
+                openApi = validateResult.specification;
+                console.log(chalk.green(`✅ Successfully validated OpenAPI specification`));
+            } else {
+                console.log(chalk.yellow(`⚠️  Validation failed, attempting to use bundled result directly...`));
+                if (validateResult.errors) {
+                    for (const error of validateResult.errors) {
+                        console.log(chalk.yellow(`  - ${error.message}`));
+                    }
+                }
+
+                // Try to use the bundled result directly if it has the basic structure
+                if (bundleResult && typeof bundleResult === 'object' && 'paths' in bundleResult) {
+                    openApi = bundleResult as OpenAPI.Document;
+                    console.log(chalk.green(`✅ Using bundled result (validation bypassed)`));
+                } else {
+                    console.error(chalk.red(`❌ Cannot use bundled result - missing required structure`));
+                    throw new Error("Invalid OpenAPI specification");
+                }
+            }
+        } catch (validationError) {
+            console.log(chalk.yellow(`⚠️  Validation failed, attempting to use bundled result directly...`));
+            console.log(chalk.yellow(`  - ${(validationError as Error).message}`));
+
+            // Try to use the bundled result directly if it has the basic structure
+            if (bundleResult && typeof bundleResult === 'object' && 'paths' in bundleResult) {
+                openApi = bundleResult as OpenAPI.Document;
+                console.log(chalk.green(`✅ Using bundled result (validation bypassed)`));
+            } else {
+                console.error(chalk.red(`❌ Cannot use bundled result - missing required structure`));
+                throw new Error("Invalid OpenAPI specification");
+            }
+        }
+
+        if (!openApi || !openApi.paths) {
+            throw new Error("Invalid OpenAPI specification - missing paths");
+        }
+
+        // Try to dereference for better reference resolution
+        try {
+            console.log(chalk.blue(`🔄 Attempting to dereference OpenAPI specification...`));
+            const dereferenceResult = await dereference(openApi);
+
+            if (dereferenceResult.specification && dereferenceResult.specification.paths) {
+                openApi = dereferenceResult.specification;
+                console.log(chalk.green(`✅ Successfully dereferenced OpenAPI specification`));
+            }
+        } catch (dereferenceError) {
+            console.log(chalk.yellow(`⚠️  Could not dereference all references, using validated version: ${(dereferenceError as Error).message}`));
+        }
 
         // Extract basic group paths
         const groupPaths = extractGroupPaths(openApi);
