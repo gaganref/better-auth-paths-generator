@@ -1,0 +1,18 @@
+{
+  "name": "generate-types",
+  "private": true,
+  "scripts": {
+    "generate": "bun run src/generate-types.ts --response-fields '[\"email\"]' --request-fields '[\"email\"]'",
+    "dev": "bun --watch run src/generate-types.ts",
+    "typecheck": "bun --bun tsc --noEmit"
+  },
+  "dependencies": {
+    "yaml": "^2.3.4"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.18"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
