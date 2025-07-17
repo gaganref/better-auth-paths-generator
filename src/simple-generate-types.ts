@@ -124,7 +124,8 @@ function extractGroupPaths(openApi: OpenAPI.Document): Record<string, string[]> 
 function findFieldsInSchema(
     schema: OpenAPI.SchemaObject | any,
     targetFields: string[],
-    depth: number = 0
+    depth: number = 0,
+    openApiDoc?: OpenAPI.Document
 ): string[] {
     const foundFields: string[] = [];
 
@@ -135,6 +136,33 @@ function findFieldsInSchema(
     // Prevent infinite recursion
     if (depth > 10) {
         return foundFields;
+    }
+
+    // Handle $ref references
+    if (schema.$ref && openApiDoc) {
+        try {
+            const refPath = schema.$ref.replace('#/', '').split('/');
+            let resolvedSchema = openApiDoc as any;
+
+            for (const segment of refPath) {
+                resolvedSchema = resolvedSchema[segment];
+                if (!resolvedSchema) {
+                    break;
+                }
+            }
+
+            if (resolvedSchema) {
+                const nestedFields = findFieldsInSchema(
+                    resolvedSchema,
+                    targetFields,
+                    depth + 1,
+                    openApiDoc
+                );
+                foundFields.push(...nestedFields);
+            }
+        } catch (error) {
+            // If reference resolution fails, continue with other checks
+        }
     }
 
     // Check direct properties
@@ -150,7 +178,8 @@ function findFieldsInSchema(
             const nestedFields = findFieldsInSchema(
                 schema.properties[prop],
                 targetFields,
-                depth + 1
+                depth + 1,
+                openApiDoc
             );
             foundFields.push(...nestedFields);
         }
@@ -161,7 +190,8 @@ function findFieldsInSchema(
         const nestedFields = findFieldsInSchema(
             schema.items,
             targetFields,
-            depth + 1
+            depth + 1,
+            openApiDoc
         );
         foundFields.push(...nestedFields);
     }
@@ -177,7 +207,8 @@ function findFieldsInSchema(
             const nestedFields = findFieldsInSchema(
                 schema.additionalProperties,
                 targetFields,
-                depth + 1
+                depth + 1,
+                openApiDoc
             );
             foundFields.push(...nestedFields);
         } else if (schema.additionalProperties === true) {
@@ -193,7 +224,8 @@ function findFieldsInSchema(
                 const nestedFields = findFieldsInSchema(
                     subSchema,
                     targetFields,
-                    depth + 1
+                    depth + 1,
+                    openApiDoc
                 );
                 foundFields.push(...nestedFields);
             }
@@ -233,7 +265,7 @@ function extractResponseFieldPaths(
                         for (const mediaType in (response as any).content) {
                             const mediaObj = (response as any).content[mediaType];
                             if (mediaObj.schema) {
-                                const foundFields = findFieldsInSchema(mediaObj.schema, targetFields);
+                                const foundFields = findFieldsInSchema(mediaObj.schema, targetFields, 0, openApi);
                                 for (const foundField of foundFields) {
                                     fieldPaths[foundField].add(path);
                                 }
@@ -281,7 +313,7 @@ function extractRequestFieldPaths(
                     for (const mediaType in (operation.requestBody as any).content) {
                         const mediaObj = (operation.requestBody as any).content[mediaType];
                         if (mediaObj.schema) {
-                            const foundFields = findFieldsInSchema(mediaObj.schema, targetFields);
+                            const foundFields = findFieldsInSchema(mediaObj.schema, targetFields, 0, openApi);
                             for (const foundField of foundFields) {
                                 fieldPaths[foundField].add(path);
                             }
